@@ -20,6 +20,7 @@ struct RangeTestData {
     int16_t rssi;
     int8_t snr;
     uint8_t spreadingFactor;
+    uint8_t dataRate;
     uint32_t frequency;
     int16_t gatewayRssi;
     float batteryVoltage;
@@ -60,6 +61,12 @@ public:
 
     // Get auto mode status
     bool isAutoMode();
+
+    // Data rate control (EU868: 0 = SF12 .. 5 = SF7)
+    bool setDataRate(uint8_t dr);
+    void enableAdr();
+    bool isAdrEnabled();
+    uint8_t getDataRate();
 
     // Event callbacks
     void onJoinSuccess(void (*callback)());

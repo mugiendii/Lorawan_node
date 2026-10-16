@@ -130,6 +130,27 @@ void LoRaWANModule::setAutoMode(bool enabled) {
     }
 }
 
+// Data rate: 0 (SF12, longest range) .. 5 (SF7, fastest). Turns ADR off so the network keeps it.
+bool LoRaWANModule::setDataRate(uint8_t dr) {
+    if (dr > 5) return false;
+    LMIC_setAdrMode(0);
+    LMIC_setDrTxpow(dr, 14);
+    return true;
+}
+
+// Let the network server (ChirpStack ADR) choose the data rate again
+void LoRaWANModule::enableAdr() {
+    LMIC_setAdrMode(1);
+}
+
+bool LoRaWANModule::isAdrEnabled() {
+    return LMIC.adrEnabled != 0;
+}
+
+uint8_t LoRaWANModule::getDataRate() {
+    return LMIC.datarate;
+}
+
 // Get auto mode status
 bool LoRaWANModule::isAutoMode() {
     return autoMode;
@@ -155,11 +176,10 @@ void LoRaWANModule::process() {
 
 // Prepare range test data
 void LoRaWANModule::prepareRangeTestData() {
+    // RSSI/SNR here are from the previous ACK; they are refreshed when this packet's ACK arrives
     rangeData.packetCounter = packetCounter++;
-    rangeData.rssi = LMIC.rssi;
-    rangeData.snr = LMIC.snr;
-    rangeData.spreadingFactor = getSf(LMIC.datarate) + 6;
-    rangeData.frequency = LMIC.freq;
+    rangeData.spreadingFactor = 12 - LMIC.datarate;  // EU868: DR0 = SF12 .. DR5 = SF7
+    rangeData.dataRate = LMIC.datarate;
     rangeData.gatewayRssi = 0;
     rangeData.batteryVoltage = 3.3; // TODO: Read from ADC
 }
@@ -267,13 +287,10 @@ void onEvent(ev_t ev) {
             Serial.println(F("EV_TXCOMPLETE (includes waiting for RX windows)"));
 
             if (LMIC.txrxFlags & TXRX_ACK) {
+                // LMIC stores RSSI offset by RSSI_OFF and SNR in quarter-dB steps
+                lorawan.rangeData.rssi = LMIC.rssi - RSSI_OFF;
+                lorawan.rangeData.snr = LMIC.snr / SNR_SCALEUP;
                 Serial.println(F("Received ack"));
-                Serial.print(F("Gateway RSSI: "));
-                Serial.print(LMIC.rssi);
-                Serial.println(F(" dBm"));
-                Serial.print(F("Gateway SNR: "));
-                Serial.print(LMIC.snr);
-                Serial.println(F(" dB"));
             }
 
             if (LMIC.dataLen) {
@@ -288,8 +305,8 @@ void onEvent(ev_t ev) {
                 Serial.println();
             }
 
-            // Handle TX complete
-            if (!lorawan.autoMode && lorawan.uplinkRequested && lorawan.waitingForResponse) {
+            // Report every result; in AUTO mode there is no TRIGGER request to wait on
+            if (lorawan.autoMode || (lorawan.uplinkRequested && lorawan.waitingForResponse)) {
                 bool success = (LMIC.txrxFlags & TXRX_ACK) || (LMIC.dataLen > 0);
                 lorawan.uplinkRequested = false;
                 lorawan.waitingForResponse = false;
@@ -327,6 +344,10 @@ void onEvent(ev_t ev) {
 
         case EV_TXSTART:
             Serial.println(F("EV_TXSTART"));
+            // Channel and data rate actually used for this uplink
+            lorawan.rangeData.frequency = LMIC.freq;
+            lorawan.rangeData.dataRate = LMIC.datarate;
+            lorawan.rangeData.spreadingFactor = 12 - LMIC.datarate;
             break;
 
         case EV_TXCANCELED:

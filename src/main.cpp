@@ -61,6 +61,7 @@ void sendDataToServer(const char* serverUrl, const RangeTestData& data) {
         payload += "\"rssi\":" + String(data.rssi) + ",";
         payload += "\"snr\":" + String(data.snr) + ",";
         payload += "\"sf\":" + String(data.spreadingFactor) + ",";
+        payload += "\"dr\":" + String(data.dataRate) + ",";
         payload += "\"freq\":" + String(data.frequency) + ",";
         payload += "\"gw_rssi\":" + String(data.gatewayRssi) + ",";
         payload += "\"battery\":" + String(data.batteryVoltage, 2);
@@ -101,6 +102,26 @@ void processSerialCommand(String cmd) {
         }
         Serial.print(F("Packets sent: "));
         Serial.println(lorawan.getPacketCount());
+        Serial.print(F("Data rate: DR"));
+        Serial.print(lorawan.getDataRate());
+        Serial.print(F(" (SF"));
+        Serial.print(12 - lorawan.getDataRate());
+        Serial.print(F("), ADR "));
+        Serial.println(lorawan.isAdrEnabled() ? F("on") : F("off"));
+    } else if (cmd.startsWith("DR ")) {
+        int dr = cmd.substring(3).toInt();
+        if (cmd.length() > 3 && isDigit(cmd[3]) && lorawan.setDataRate(dr)) {
+            Serial.print(F("Data rate set to DR"));
+            Serial.print(dr);
+            Serial.print(F(" (SF"));
+            Serial.print(12 - dr);
+            Serial.println(F("), ADR off"));
+        } else {
+            Serial.println(F("Usage: DR <0-5>  (0 = SF12 longest range, 5 = SF7 fastest)"));
+        }
+    } else if (cmd == "ADR") {
+        lorawan.enableAdr();
+        Serial.println(F("ADR on - network server chooses the data rate"));
     } else if (cmd == "HELP") {
         printHelp();
     } else {
@@ -125,6 +146,8 @@ void printHelp() {
     Serial.println(F("  AUTO    - Enable automatic transmission mode"));
     Serial.println(F("  MANUAL  - Enable manual command mode"));
     Serial.println(F("  STATUS  - Show device status"));
+    Serial.println(F("  DR <n>  - Fix data rate 0-5 (0 = SF12 .. 5 = SF7), ADR off"));
+    Serial.println(F("  ADR     - Let the network choose the data rate"));
     Serial.println(F("  HELP    - Show this help"));
 }
 
@@ -143,8 +166,7 @@ void printRangeTestResult(bool success) {
     Serial.print(F("Packet #: "));
     Serial.println(data.packetCounter);
 
-    // Uplink (device -> gateway) metrics
-    Serial.println(F("\n--- Uplink Quality ---"));
+    // Measured by the device on the gateway's ACK (downlink)
     Serial.print(F("RSSI: "));
     Serial.print(data.rssi);
     Serial.println(F(" dBm"));
@@ -153,36 +175,16 @@ void printRangeTestResult(bool success) {
     Serial.println(F(" dB"));
     Serial.print(F("SF: "));
     Serial.println(data.spreadingFactor);
+    Serial.print(F("DR: "));
+    Serial.println(data.dataRate);
     Serial.print(F("Freq: "));
     Serial.print(data.frequency / 1000000.0, 1);
     Serial.println(F(" MHz"));
 
-    // Downlink (gateway -> device) metrics
-    Serial.println(F("\n--- Downlink Quality ---"));
-    Serial.print(F("Gateway RSSI: "));
-    Serial.print(LMIC.rssi);
-    Serial.println(F(" dBm"));
-    Serial.print(F("Gateway SNR: "));
-    Serial.print(LMIC.snr);
-    Serial.println(F(" dB"));
-
-    // Distance estimate (rough calculation based on RSSI)
-    int avgRssi = (data.rssi + LMIC.rssi) / 2;
-    float distance = 0;
-    if (avgRssi > -50) distance = 0.01;  // < 50m
-    else if (avgRssi > -70) distance = 0.1;   // 50-200m
-    else if (avgRssi > -90) distance = 0.5;   // 200-500m
-    else if (avgRssi > -110) distance = 2.0;  // 500m-2km
-    else distance = 5.0;  // > 2km
-
-    Serial.println(F("\n--- Estimated Range ---"));
-    Serial.print(F("Distance: ~"));
-    Serial.print(distance, 2);
-    Serial.println(F(" km"));
     Serial.print(F("Link Quality: "));
-    if (avgRssi > -70) Serial.println(F("EXCELLENT"));
-    else if (avgRssi > -90) Serial.println(F("GOOD"));
-    else if (avgRssi > -110) Serial.println(F("FAIR"));
+    if (data.rssi > -70) Serial.println(F("EXCELLENT"));
+    else if (data.rssi > -90) Serial.println(F("GOOD"));
+    else if (data.rssi > -110) Serial.println(F("FAIR"));
     else Serial.println(F("POOR"));
     #ifdef USE_WIFI
     // Send to HTTP server
