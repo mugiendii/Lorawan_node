@@ -4,6 +4,7 @@
 
 #ifdef USE_WIFI
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
 #endif
@@ -20,30 +21,106 @@ void onJoinSuccessCallback();
 void onJoinFailedCallback();
 void onTxCompleteCallback(bool success);
 
+// Data rate sweep
+extern bool sweepActive;
+void startSweep();
+void finishSweep(int recommended, int fallback);
+
 #ifdef USE_WIFI
-void setupWiFi(const char* ssid, const char* password);
+void setupWiFi();
+void checkWiFi();
 void sendDataToServer(const char* serverUrl, const RangeTestData& data);
 #endif
 
 // WiFi functions
 #ifdef USE_WIFI
-void setupWiFi(const char* ssid, const char* password) {
-    Serial.println(F("Connecting to WiFi..."));
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
+const __FlashStringHelper* wifiStatusText(wl_status_t status) {
+    switch (status) {
+        case WL_CONNECTED:       return F("connected");
+        case WL_NO_SSID_AVAIL:   return F("network not found (check name, and that the hotspot is on 2.4 GHz)");
+        case WL_WRONG_PASSWORD:  return F("wrong password");
+        case WL_CONNECT_FAILED:  return F("connection refused (check WPA2, not WPA3-only)");
+        case WL_IDLE_STATUS:     return F("still connecting");
+        case WL_DISCONNECTED:    return F("disconnected");
+        default:                 return F("unknown");
     }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println();
-        Serial.print(F("WiFi connected! IP: "));
-        Serial.println(WiFi.localIP());
+}
+
+ESP8266WiFiMulti wifiMulti;
+const size_t WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
+
+// List what the radio can hear, marking the configured networks
+void printVisibleNetworks() {
+    int found = WiFi.scanNetworks();
+    Serial.print(F("Networks visible: "));
+    Serial.println(found);
+    for (int i = 0; i < found; i++) {
+        bool known = false;
+        for (size_t n = 0; n < WIFI_NETWORK_COUNT; n++) {
+            if (WiFi.SSID(i) == WIFI_NETWORKS[n].ssid) known = true;
+        }
+        Serial.print(known ? F("  * ") : F("    "));
+        Serial.print(WiFi.SSID(i));
+        Serial.print(F("  ch"));
+        Serial.print(WiFi.channel(i));
+        Serial.print(F("  "));
+        Serial.print(WiFi.RSSI(i));
+        Serial.println(F(" dBm"));
+    }
+    WiFi.scanDelete();
+}
+
+void setupWiFi() {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    Serial.print(F("WiFi networks configured: "));
+    for (size_t n = 0; n < WIFI_NETWORK_COUNT; n++) {
+        wifiMulti.addAP(WIFI_NETWORKS[n].ssid, WIFI_NETWORKS[n].password);
+        if (n) Serial.print(F(", "));
+        Serial.print(WIFI_NETWORKS[n].ssid);
+    }
+    Serial.println();
+
+    // Joins the strongest configured network that is in range
+    if (wifiMulti.run(20000) == WL_CONNECTED) {
+        Serial.print(F("WiFi connected to \""));
+        Serial.print(WiFi.SSID());
+        Serial.print(F("\"! IP: "));
+        Serial.print(WiFi.localIP());
+        Serial.print(F("  RSSI: "));
+        Serial.print(WiFi.RSSI());
+        Serial.println(F(" dBm"));
     } else {
-        Serial.println();
-        Serial.println(F("WiFi connection failed!"));
+        Serial.println(F("WiFi not connected: none of the configured networks answered"));
+        Serial.println(F("(* = configured network; missing means the device cannot see it)"));
+        printVisibleNetworks();
+        Serial.println(F("Will keep retrying in the background"));
+    }
+}
+
+// Report WiFi changes and retry the network list while disconnected.
+// Retries only run while the LoRa radio is idle: a scan blocks for a few seconds.
+void checkWiFi() {
+    static wl_status_t lastStatus = WL_IDLE_STATUS;
+    static unsigned long lastRetry = 0;
+    wl_status_t status = WiFi.status();
+
+    if (status != lastStatus) {
+        lastStatus = status;
+        if (status == WL_CONNECTED) {
+            Serial.print(F("WiFi connected to \""));
+            Serial.print(WiFi.SSID());
+            Serial.print(F("\"! IP: "));
+            Serial.println(WiFi.localIP());
+        } else {
+            Serial.print(F("WiFi: "));
+            Serial.println(wifiStatusText(status));
+        }
+    }
+
+    if (status != WL_CONNECTED && !lorawan.isBusy() && millis() - lastRetry > 30000) {
+        lastRetry = millis();
+        wifiMulti.run(5000);
     }
 }
 
@@ -119,6 +196,10 @@ void processSerialCommand(String cmd) {
         } else {
             Serial.println(F("Usage: DR <0-5>  (0 = SF12 longest range, 5 = SF7 fastest)"));
         }
+    } else if (cmd == "SWEEP") {
+        startSweep();
+    } else if (cmd == "STOP") {
+        if (sweepActive) finishSweep(-1, -1);
     } else if (cmd == "ADR") {
         lorawan.enableAdr();
         Serial.println(F("ADR on - network server chooses the data rate"));
@@ -148,6 +229,8 @@ void printHelp() {
     Serial.println(F("  STATUS  - Show device status"));
     Serial.println(F("  DR <n>  - Fix data rate 0-5 (0 = SF12 .. 5 = SF7), ADR off"));
     Serial.println(F("  ADR     - Let the network choose the data rate"));
+    Serial.println(F("  SWEEP   - Test DR5..DR0 here and recommend a data rate"));
+    Serial.println(F("  STOP    - Stop a running sweep"));
     Serial.println(F("  HELP    - Show this help"));
 }
 
@@ -206,14 +289,156 @@ void onJoinFailedCallback() {
     Serial.println(F("Check credentials and gateway"));
 }
 
+// ---------- Data rate sweep ----------
+// Tries DR5 (SF7) down to DR0 (SF12) and stops at the first data rate where every
+// uplink is ACKed with at least SWEEP_MARGIN_DB of SNR margin.
+struct SweepStep {
+    uint8_t acks;
+    int snrTotal;
+    int rssiTotal;
+};
+
+bool sweepActive = false;
+bool sweepSendNext = false;
+int sweepDr = 5;
+uint8_t sweepTry = 0;
+SweepStep sweepSteps[6];
+bool sweepWasAuto = false;
+bool sweepWasAdr = true;
+uint8_t sweepPrevDr = 0;
+
+// Lowest SNR (dB) the SX127x can decode at each spreading factor, SF7..SF12
+float requiredSnr(uint8_t sf) {
+    static const float limits[] = { -7.5, -10, -12.5, -15, -17.5, -20 };
+    return limits[sf - 7];
+}
+
+void startSweep() {
+    if (!lorawan.isJoined()) {
+        Serial.println(F("SWEEP: join the network first"));
+        return;
+    }
+    if (sweepActive) {
+        Serial.println(F("SWEEP: already running"));
+        return;
+    }
+    sweepWasAuto = lorawan.isAutoMode();
+    sweepWasAdr = lorawan.isAdrEnabled();
+    sweepPrevDr = lorawan.getDataRate();
+    lorawan.setAutoMode(false);
+    memset(sweepSteps, 0, sizeof(sweepSteps));
+    sweepDr = 5;
+    sweepTry = 0;
+    sweepActive = true;
+    sweepSendNext = true;
+    Serial.println(F("DR SWEEP: START"));
+    Serial.print(F("Margin needed: "));
+    Serial.print(SWEEP_MARGIN_DB);
+    Serial.print(F(" dB, uplinks per DR: "));
+    Serial.println(SWEEP_TRIES);
+    Serial.println(F("(slower data rates wait for the 1% duty cycle; the full sweep can take minutes)"));
+}
+
+void finishSweep(int recommended, int fallback) {
+    sweepActive = false;
+    sweepSendNext = false;
+
+    if (recommended >= 0) {
+        Serial.print(F("DR SWEEP: RECOMMENDED DR"));
+        Serial.print(recommended);
+        Serial.print(F(" (SF"));
+        Serial.print(12 - recommended);
+        Serial.println(F(")"));
+    } else if (fallback >= 0) {
+        Serial.print(F("DR SWEEP: RECOMMENDED DR"));
+        Serial.print(fallback);
+        Serial.print(F(" (SF"));
+        Serial.print(12 - fallback);
+        Serial.println(F(") LOW MARGIN"));
+        Serial.println(F("Every ACK arrived but below the margin; expect losses in bad conditions"));
+    } else {
+        Serial.println(F("DR SWEEP: NO COVERAGE"));
+        Serial.println(F("No data rate got every ACK at this location"));
+    }
+
+    // Put the device back the way it was
+    if (sweepWasAdr) lorawan.enableAdr();
+    else lorawan.setDataRate(sweepPrevDr);
+    lorawan.setAutoMode(sweepWasAuto);
+    Serial.println(F("DR SWEEP: END"));
+}
+
+void sweepRecord(bool success) {
+    SweepStep& step = sweepSteps[sweepDr];
+    if (success) {
+        RangeTestData data = lorawan.getLastRangeData();
+        step.acks++;
+        step.snrTotal += data.snr;
+        step.rssiTotal += data.rssi;
+    }
+    sweepTry++;
+    if (sweepTry < SWEEP_TRIES) {
+        sweepSendNext = true;
+        return;
+    }
+
+    // All tries at this data rate are done
+    uint8_t sf = 12 - sweepDr;
+    Serial.print(F("SWEEP DR"));
+    Serial.print(sweepDr);
+    Serial.print(F(" SF"));
+    Serial.print(sf);
+    Serial.print(F(": "));
+    Serial.print(step.acks);
+    Serial.print(F("/"));
+    Serial.print(SWEEP_TRIES);
+    Serial.print(F(" ACK"));
+    bool good = false;
+    if (step.acks > 0) {
+        float snr = (float)step.snrTotal / step.acks;
+        float margin = snr - requiredSnr(sf);
+        Serial.print(F(", RSSI "));
+        Serial.print(step.rssiTotal / step.acks);
+        Serial.print(F(" dBm, SNR "));
+        Serial.print(snr, 1);
+        Serial.print(F(" dB, margin "));
+        Serial.print(margin, 1);
+        Serial.print(F(" dB"));
+        good = step.acks == SWEEP_TRIES && margin >= SWEEP_MARGIN_DB;
+    }
+    Serial.println();
+
+    if (good) {
+        finishSweep(sweepDr, -1);
+        return;
+    }
+    if (sweepDr == 0) {
+        // Nothing met the margin: fall back to the fastest data rate that got every ACK
+        int fallback = -1;
+        for (int dr = 5; dr >= 0 && fallback < 0; dr--) {
+            if (sweepSteps[dr].acks == SWEEP_TRIES) fallback = dr;
+        }
+        finishSweep(-1, fallback);
+        return;
+    }
+    sweepDr--;
+    sweepTry = 0;
+    sweepSendNext = true;
+}
+
 void onTxCompleteCallback(bool success) {
     printRangeTestResult(success);
+    if (sweepActive) sweepRecord(success);
 }
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println(F("   LoRaWAN Range Test Node"));
+    // "Power On" / "External System" are normal; "Hardware Watchdog" or repeated
+    // resets during TX usually mean the supply dips when the radio transmits
+    Serial.print(F("Reset reason: "));
+    Serial.println(ESP.getResetReason());
     
     Serial.println(F("Target: ChirpStack Gateway"));
     Serial.println(F("Region: EU868"));
@@ -231,7 +456,7 @@ void setup() {
 
     #ifdef USE_WIFI
     // Setup WiFi for HTTP logging
-    setupWiFi(WIFI_SSID, WIFI_PASSWORD);
+    setupWiFi();
     #endif
 
     // Print credentials for verification
@@ -265,6 +490,28 @@ void setup() {
 void loop() {
     // Process LoRaWAN events
     lorawan.process();
+
+    // Next sweep uplink once the radio is free (LMIC waits out the duty cycle itself)
+    if (sweepSendNext && !lorawan.isBusy()) {
+        sweepSendNext = false;
+        lorawan.setDataRate(sweepDr);
+        lorawan.sendUplink();
+    }
+
+    // Apply the configured data rate once after joining
+    static bool wasJoined = false;
+    if (!wasJoined && lorawan.isJoined()) {
+        wasJoined = true;
+        if (DEFAULT_DR >= 0 && DEFAULT_DR <= 5) {
+            lorawan.setDataRate(DEFAULT_DR);
+            Serial.print(F("Data rate fixed at DR"));
+            Serial.println(DEFAULT_DR);
+        }
+    }
+
+    #ifdef USE_WIFI
+    checkWiFi();
+    #endif
 
     // Handle serial commands
     if (Serial.available()) {

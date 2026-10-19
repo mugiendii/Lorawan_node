@@ -124,7 +124,10 @@ RangeTestData LoRaWANModule::getLastRangeData() {
 // Set auto mode
 void LoRaWANModule::setAutoMode(bool enabled) {
     autoMode = enabled;
-    if (enabled) {
+    if (!enabled) {
+        // Drop the next scheduled automatic uplink
+        os_clearCallback(&sendjob);
+    } else {
         // Schedule next transmission
         os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), do_send);
     }
@@ -348,6 +351,10 @@ void onEvent(ev_t ev) {
             lorawan.rangeData.frequency = LMIC.freq;
             lorawan.rangeData.dataRate = LMIC.datarate;
             lorawan.rangeData.spreadingFactor = 12 - LMIC.datarate;
+            // One attempt per confirmed uplink. Otherwise LMIC retries up to 8 times and
+            // permanently lowers the data rate on missed ACKs, which hides poor coverage.
+            // Set here, after the frame (and its counter) has been built.
+            if (LMIC.txCnt != 0) LMIC.txCnt = TXCONF_ATTEMPTS;
             break;
 
         case EV_TXCANCELED:

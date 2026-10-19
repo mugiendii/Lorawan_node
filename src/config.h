@@ -11,9 +11,19 @@
 #define USE_WIFI
 
 #ifdef USE_WIFI
-    // Your WiFi credentials
-    #define WIFI_SSID "Mugi"
-    #define WIFI_PASSWORD "12345677"
+    // WiFi networks to try, as { "SSID", "password" } pairs.
+    // The device joins whichever listed network is strongest, and switches
+    // to another one if it drops. Networks must be 2.4 GHz, WPA2.
+    struct WifiNetwork {
+        const char* ssid;
+        const char* password;
+    };
+
+    static const WifiNetwork WIFI_NETWORKS[] = {
+        { "Mugi", "12345677" },
+        { "guest", "grundfosguest08" },
+        // { "Site hotspot", "another-password" },
+    };
 
     // Server configuration
     // Plain HTTP: nginx on the VPS keeps /api/rangetest reachable without TLS
@@ -29,6 +39,19 @@
 
 // Transmission interval (seconds)
 #define TX_INTERVAL 30  // Send packet every 30 seconds
+
+// =========================================
+// Data rate (EU868: DR0 = SF12 slowest/longest range .. DR5 = SF7 fastest)
+// =========================================
+// Data rate after joining: -1 lets ChirpStack choose (ADR), 0-5 fixes it.
+// Can also be changed at runtime with the DR <n> and ADR serial commands.
+#define DEFAULT_DR -1
+
+// SWEEP serial command: tries DR5 down to DR0 and recommends the fastest
+// data rate that gets every ACK with at least this much SNR margin.
+// 10 dB matches ChirpStack's default ADR installation margin.
+#define SWEEP_MARGIN_DB 10
+#define SWEEP_TRIES 2   // uplinks per data rate
 
 // =========================================
 // LoRaWAN Credentials (ChirpStack OTAA)
