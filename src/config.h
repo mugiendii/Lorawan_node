@@ -16,10 +16,9 @@
     #define WIFI_PASSWORD "12345677"
 
     // Server configuration
-    
-    // Replace YOUR_COMPUTER_IP with the IP address of the computer running server.py
-    // Example: "http://192.168.1.100:9000/api/rangetest"
-    #define SERVER_URL "http://172.16.0.19:9000/api/rangetest"
+    // Plain HTTP: nginx on the VPS keeps /api/rangetest reachable without TLS
+    // For a local server use e.g. "http://192.168.1.100:9000/api/rangetest"
+    #define SERVER_URL "http://rangetest.nodewave.dev/api/rangetest"
 #endif
 
 // =========================================
